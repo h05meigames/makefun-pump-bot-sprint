@@ -9,6 +9,10 @@
 //     take-profit, a stop-loss, a trailing stop, or a max hold time so capital
 //     keeps rotating across many coins (the guardrail needs round trips on at
 //     least 20 distinct mints).
+//   * Entry needs a strong trend, not just any uptick: price up >= 10% since first
+//     sighting, buy volume >= 2x sell volume, still rising on the latest trade and
+//     still within 8% of its observed peak. Exits: +50% take-profit, -10% stop-loss,
+//     -12% trailing stop, 900-slot max hold.
 //   * Everything is deterministic: all decisions come from slot numbers and event
 //     data only — no clock, no environment, no unseeded randomness — so two runs
 //     on the same replay produce byte-identical action logs.
@@ -23,27 +27,38 @@ const SCALE = 1_000_000_000n; // price scale factor (lamports per token * SCALE)
 const BUY_SIZE_LAMPORTS = 250_000_000n; // 0.25 SOL per entry
 const MIN_BUY_LAMPORTS = 50_000_000n; // never open below 0.05 SOL (guardrail needs 0.01 SOL round trips)
 const MAX_OPEN = 5; // harness caps.max_open_positions
-const MAX_HOLD_SLOTS = 1500; // force rotation: exit a position this old
+const MAX_HOLD_SLOTS = 900; // force rotation: exit a position this old (slow bleeders get cut)
 const FRESH_SLOTS = 3000; // only enter coins first seen within this many slots
 const MIN_TRADES = 3; // need at least this many trades before trusting the flow
 const MIN_REAL_SOL_RESERVES = 500_000_000n; // 0.5 SOL of real reserves: skip dust curves
-const SLIPPAGE_BPS = 500;
+// Slippage: the dev run rejected 3,703 orders at 500 bps — on fast coins the
+// price moves more than 5% in the 2-slot fill latency, so entries never landed
+// and exits lagged. 1,500 bps still caps how bad a fill can be.
+const SLIPPAGE_BPS = 1500;
+// After a buy is rejected, wait this many slots before retrying the same mint
+// instead of spamming a retry on every batch.
+const REJECT_COOLDOWN_SLOTS = 15;
 
 // Entry filters (all in integer percent, applied to scaled prices):
-const MIN_MOMENTUM_PCT = 5; // price up >= 5% since first sighting
-const MAX_MOMENTUM_PCT = 200; // price up <= 200% since first sighting (don't chase vertical)
-const BUY_DOMINANCE_NUM = 3; // buy SOL volume >= 1.5x sell SOL volume (3/2)
+// Dev run: win rate 28.7% at +30%/-12% — too many weak entries. Tighter
+// filters (stronger momentum, 2x buy dominance, still rising, near its peak)
+// trade less often for a better payoff ratio: +50%/-10% only needs ~21% wins.
+const MIN_MOMENTUM_PCT = 10; // price up >= 10% since first sighting
+const MAX_MOMENTUM_PCT = 150; // price up <= 150% since first sighting (don't chase vertical)
+const BUY_DOMINANCE_NUM = 4; // buy SOL volume >= 2x sell SOL volume (4/2)
 const BUY_DOMINANCE_DEN = 2;
+const NEAR_PEAK_PCT = 8; // entry price within 8% of the mint's observed peak
 
 // Exit rules (integer percent of entry price / peak price):
-const TAKE_PROFIT_PCT = 30;
-const STOP_LOSS_PCT = 12;
-const TRAILING_STOP_PCT = 10;
+const TAKE_PROFIT_PCT = 50;
+const STOP_LOSS_PCT = 10;
+const TRAILING_STOP_PCT = 12;
 
 interface MintStats {
   firstPrice: bigint;
   lastPrice: bigint;
-  peakPrice: bigint;
+  prevPrice: bigint; // price before the latest trade (still-rising check)
+  peakPrice: bigint; // highest price seen, held or not (near-peak check)
   buyVol: bigint;
   sellVol: bigint;
   trades: number;
@@ -51,6 +66,7 @@ interface MintStats {
   createdSlot: number | null;
   entryPrice: bigint | null;
   entrySlot: number;
+  coolUntilSlot: number; // don't retry a rejected buy before this slot
 }
 
 /** Scaled price of a curve from its virtual reserves; 0n when reserves are empty. */
@@ -80,6 +96,7 @@ function statsFor(mint: string, slot: number): MintStats {
     s = {
       firstPrice: 0n,
       lastPrice: 0n,
+      prevPrice: 0n,
       peakPrice: 0n,
       buyVol: 0n,
       sellVol: 0n,
@@ -88,6 +105,7 @@ function statsFor(mint: string, slot: number): MintStats {
       createdSlot: null,
       entryPrice: null,
       entrySlot: 0,
+      coolUntilSlot: 0,
     };
     stats.set(mint, s);
   }
@@ -119,7 +137,9 @@ await runBot({
       } else if (e.event === 'TradeEvent') {
         const p = priceOf(BigInt(e.virtual_quote_reserves), BigInt(e.virtual_token_reserves));
         if (s.firstPrice === 0n) s.firstPrice = p;
+        s.prevPrice = s.lastPrice;
         s.lastPrice = p;
+        if (p > s.peakPrice) s.peakPrice = p;
         s.trades += 1;
         if (e.is_buy) s.buyVol += BigInt(e.sol_amount);
         else s.sellVol += BigInt(e.sol_amount);
@@ -129,8 +149,14 @@ await runBot({
       }
     }
 
-    // --- 2. Record buy fills as entries (price at the batch they land). ---
+    // --- 2. Record buy fills as entries (price at the batch they land), and
+    // cool down mints whose buy was rejected so we stop retrying every batch. ---
     for (const f of batch.fills) {
+      const s = statsFor(f.mint, slot);
+      if (f.status === 'rejected' && f.side === 'buy') {
+        s.coolUntilSlot = f.slot + REJECT_COOLDOWN_SLOTS;
+        continue;
+      }
       if (f.status !== 'filled') continue;
       const curve = state.curves.get(f.mint);
       if (curve === undefined) continue;
@@ -158,6 +184,17 @@ await runBot({
 
     // --- 4. Exits: take-profit, stop-loss, trailing stop, max hold time. ---
     for (const [mint, holding] of state.positions) {
+      // BUG FIX (found in dev grading): the old code sent a sell on every batch
+      // until the fill landed 2 slots later, emitting 3-4 duplicate sells per
+      // exit. Skip a mint that already has a sell pending.
+      let pendingSell = false;
+      for (const p of state.pending.values()) {
+        if (p.order.side === 'sell' && p.order.mint === mint) {
+          pendingSell = true;
+          break;
+        }
+      }
+      if (pendingSell) continue;
       const s = stats.get(mint);
       const curve = state.curves.get(mint);
       if (curve === undefined) continue;
@@ -216,10 +253,15 @@ await runBot({
         }
         const ageBase = s.createdSlot ?? s.firstSeenSlot;
         if (slot - ageBase > FRESH_SLOTS) continue;
+        if (slot < s.coolUntilSlot) continue;
         if (s.trades < MIN_TRADES) continue;
         if (s.firstPrice <= 0n || s.lastPrice <= 0n) continue;
         if (!upAtLeastPct(s.lastPrice, s.firstPrice, MIN_MOMENTUM_PCT)) continue;
         if (upAtLeastPct(s.lastPrice, s.firstPrice, MAX_MOMENTUM_PCT + 1)) continue;
+        // Still rising at entry time, and still near its observed peak: don't
+        // buy a coin that already rolled over from its high.
+        if (s.prevPrice > 0n && s.lastPrice < s.prevPrice) continue;
+        if (s.peakPrice > 0n && downAtLeastPct(s.lastPrice, s.peakPrice, NEAR_PEAK_PCT + 1)) continue;
         if (s.buyVol * BigInt(BUY_DOMINANCE_DEN) < s.sellVol * BigInt(BUY_DOMINANCE_NUM)) continue;
         if (curve.real_quote_reserves < MIN_REAL_SOL_RESERVES) continue;
 
