@@ -9,10 +9,12 @@
 //     take-profit, a stop-loss, a trailing stop, or a max hold time so capital
 //     keeps rotating across many coins (the guardrail needs round trips on at
 //     least 20 distinct mints).
-//   * Entry needs a strong trend, not just any uptick: price up >= 10% since first
+//   * Entry needs a strong trend, not just any uptick: price up >= 3% since first
 //     sighting, buy volume >= 2x sell volume, still rising on the latest trade and
-//     still within 8% of its observed peak. Exits: +50% take-profit, -10% stop-loss,
-//     -12% trailing stop, 900-slot max hold.
+//     still within 5% of its observed peak — enter EARLY, while the move is young,
+//     because the 2-slot fill latency eats two slots of adverse move on both sides.
+//     Exits: +15% take-profit, -6% stop-loss, -6% trailing stop, 600-slot max hold.
+//     Small targets, tight stops, fast rotation: a scalp, not a swing.
 //   * Everything is deterministic: all decisions come from slot numbers and event
 //     data only — no clock, no environment, no unseeded randomness — so two runs
 //     on the same replay produce byte-identical action logs.
@@ -27,32 +29,36 @@ const SCALE = 1_000_000_000n; // price scale factor (lamports per token * SCALE)
 const BUY_SIZE_LAMPORTS = 250_000_000n; // 0.25 SOL per entry
 const MIN_BUY_LAMPORTS = 50_000_000n; // never open below 0.05 SOL (guardrail needs 0.01 SOL round trips)
 const MAX_OPEN = 5; // harness caps.max_open_positions
-const MAX_HOLD_SLOTS = 900; // force rotation: exit a position this old (slow bleeders get cut)
+const MAX_HOLD_SLOTS = 600; // force rotation: exit a position this old (slow bleeders get cut)
 const FRESH_SLOTS = 3000; // only enter coins first seen within this many slots
 const MIN_TRADES = 3; // need at least this many trades before trusting the flow
 const MIN_REAL_SOL_RESERVES = 500_000_000n; // 0.5 SOL of real reserves: skip dust curves
-// Slippage: the dev run rejected 3,703 orders at 500 bps — on fast coins the
-// price moves more than 5% in the 2-slot fill latency, so entries never landed
-// and exits lagged. 1,500 bps still caps how bad a fill can be.
-const SLIPPAGE_BPS = 1500;
+// Slippage: 500 bps rejected 3,703 orders on fast coins; 1,500 bps filled them
+// but let fills land up to 15% worse than the decision price. Early entries move
+// slower, so 800 bps is the middle ground: fills land close to the decision.
+const SLIPPAGE_BPS = 800;
 // After a buy is rejected, wait this many slots before retrying the same mint
 // instead of spamming a retry on every batch.
 const REJECT_COOLDOWN_SLOTS = 15;
 
 // Entry filters (all in integer percent, applied to scaled prices):
-// Dev run: win rate 28.7% at +30%/-12% — too many weak entries. Tighter
-// filters (stronger momentum, 2x buy dominance, still rising, near its peak)
-// trade less often for a better payoff ratio: +50%/-10% only needs ~21% wins.
-const MIN_MOMENTUM_PCT = 10; // price up >= 10% since first sighting
-const MAX_MOMENTUM_PCT = 150; // price up <= 150% since first sighting (don't chase vertical)
+// Dev run 2: avg win +23.8M vs avg loss -20.4M lamports at +50%/-10% — the
+// +50% target was almost never reached, so wins were small and losses full-size.
+// The 2-slot fill latency eats ~2 slots of adverse move on both sides, so late
+// entries (momentum already +10%) buy near the top and wide targets never land.
+// Fix: enter EARLY (+3%) while the move is young, scalp a modest +15% target
+// with a tight -6% stop, and exit fast. Small targets raise the win rate enough
+// to cover the ~2.5% round-trip fees.
+const MIN_MOMENTUM_PCT = 3; // price up >= 3% since first sighting
+const MAX_MOMENTUM_PCT = 60; // price up <= 60% since first sighting (enter early, don't chase)
 const BUY_DOMINANCE_NUM = 4; // buy SOL volume >= 2x sell SOL volume (4/2)
 const BUY_DOMINANCE_DEN = 2;
-const NEAR_PEAK_PCT = 8; // entry price within 8% of the mint's observed peak
+const NEAR_PEAK_PCT = 5; // entry price within 5% of the mint's observed peak
 
 // Exit rules (integer percent of entry price / peak price):
-const TAKE_PROFIT_PCT = 50;
-const STOP_LOSS_PCT = 10;
-const TRAILING_STOP_PCT = 12;
+const TAKE_PROFIT_PCT = 15;
+const STOP_LOSS_PCT = 6;
+const TRAILING_STOP_PCT = 6;
 
 interface MintStats {
   firstPrice: bigint;
