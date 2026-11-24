@@ -160,7 +160,6 @@ await runBot({
       if (f.status !== 'filled') continue;
       const curve = state.curves.get(f.mint);
       if (curve === undefined) continue;
-      const s = statsFor(f.mint, slot);
       const p = priceOf(curve.virtual_quote_reserves, curve.virtual_token_reserves);
       if (f.side === 'buy') {
         s.entryPrice = p;
